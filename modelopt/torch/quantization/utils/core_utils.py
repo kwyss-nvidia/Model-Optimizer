@@ -157,6 +157,14 @@ def reduce_amax(input, axis=None, keepdims=True, squeeze_scalar=True):
     Returns:
         The reduced tensor.
     """
+    # FP8-native weights (DeepSeek-V3, DeepSeek-R1, Kimi-K2.5) have no CUDA
+    # kernel for torch.max / torch.min / torch.amax / torch.amin, so reductions
+    # would raise NotImplementedError("max_all_cuda not implemented for
+    # Float8_e4m3fn"). Upcast to bf16 for the reduction — amax/amin are
+    # magnitude scalars so bf16's wider range loses nothing.
+    if input.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        input = input.to(torch.bfloat16)
+
     # A memory-efficient implementation that avoids copying input tensor
     if axis is None:
         max_val = torch.max(input)

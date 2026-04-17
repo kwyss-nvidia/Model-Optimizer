@@ -14,6 +14,7 @@
 # limitations under the License.
 """Export HuggingFace model to vLLM fakequant checkpoint."""
 
+import json
 from pathlib import Path
 
 import torch
@@ -86,7 +87,14 @@ def export_hf_vllm_fq_checkpoint(
                 )
                 if sd_key in state_dict:
                     w = state_dict[sd_key]
-                    w_quant = quantizer(w.float()).to(w.dtype).cpu()
+                    # Native C++ fake-quant backends require CUDA input; w may be
+                    # CPU-resident during export. Quantize in float32, then store
+                    # at bf16 — the fake-quant output grid (e.g. scaled NVFP4
+                    # values) is not generally a subset of FP8 E4M3, so casting
+                    # back to an FP8 source dtype would re-quantize and lose
+                    # information. BF16 storage preserves values exactly at the
+                    # cost of 2× checkpoint size for FP8 source models.
+                    w_quant = quantizer(w.float().cuda()).to(torch.bfloat16).cpu()
                     # Fold pre_quant_scale: (x*s)@fake_quant(W) = x@(fake_quant(W)*s)
                     # Only valid when input_quantizer does NOT fake-quant activations. If it does
                     # fake_quant(x*s), the non-linearity prevents folding s into W.
@@ -163,6 +171,26 @@ def export_hf_vllm_fq_checkpoint(
 
     # Step 3: Save HF weights using the pre-built folded state dict.
     model.save_pretrained(export_dir, state_dict=clean_sd, save_modelopt_state=False)
+
+    # Align config.json's torch_dtype with the bf16 fake-quant storage above.
+    # Source models with a lower-precision torch_dtype (fp8_e4m3fn on DS-R1 /
+    # DS-V3 / Kimi-K2.5, or fp16 / bf16 on others) would otherwise tell vLLM
+    # to cast bf16 weights back to that source dtype on load, undoing the
+    # precision we just paid 2× checkpoint size to preserve. Never downcast
+    # a higher-precision config (fp32 / fp64) — load-time upcast to fp32 is
+    # lossless for our bf16 storage.
+    _HIGH_PRECISION_DTYPES = {"float32", "float64"}
+    config_path = export_dir / "config.json"
+    if config_path.exists():
+        cfg = json.loads(config_path.read_text())
+        current = cfg.get("torch_dtype")
+        if (
+            current is not None
+            and current not in _HIGH_PRECISION_DTYPES
+            and current != "bfloat16"
+        ):
+            cfg["torch_dtype"] = "bfloat16"
+            config_path.write_text(json.dumps(cfg, indent=2))
 
     for wq, orig_rotate in wqs_to_restore:
         wq.enable()
