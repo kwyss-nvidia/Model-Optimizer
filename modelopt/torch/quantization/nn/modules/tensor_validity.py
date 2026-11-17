@@ -64,21 +64,6 @@ class TensorValidity:
         ):
             raise ValueError("Padding mask must be a boolean vector over input rows on its device.")
 
-    def repeat_rows(self, repeats: int) -> "TensorValidity":
-        """Map token-major repetition (e.g. top-k expansion) to activation rows."""
-        if repeats < 1 or self.row_capacity is None:
-            raise ValueError("Row repetition requires positive repeats and a known capacity.")
-        if repeats == 1:
-            return self
-        return TensorValidity(
-            None if self.num_valid_rows is None else self.num_valid_rows * repeats,
-            None
-            if self.valid_rows_are_prefix or self.is_padding is None
-            else self.is_padding.repeat_interleave(repeats),
-            self.valid_rows_are_prefix,
-            self.row_capacity * repeats,
-        )
-
 
 def quantize_with_validity(quantizer, inputs, validity: TensorValidity | None = None):
     """Pass validity to supporting quantizers, otherwise preserve the legacy call."""

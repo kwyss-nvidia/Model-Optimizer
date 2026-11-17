@@ -35,7 +35,10 @@ from modelopt.torch.quantization.nn import (
     register_quant_backend,
     unregister_quant_backend,
 )
-from modelopt.torch.quantization.plugins.vllm_validity import validity_from_forward_context
+from modelopt.torch.quantization.plugins.vllm_validity import (
+    _moe_row_validities,
+    validity_from_forward_context,
+)
 
 
 def test_custom_backend_via_quantize():
@@ -219,8 +222,18 @@ def test_validity_expansion_and_invalid_layout():
     """Token-major top-k expansion preserves holes; capacity and prefix alone are insufficient."""
     v = TensorValidity(torch.tensor(2), torch.tensor([False, True, False]), False, 3)
     x = torch.ones(3, 2, 4)
-    expanded = v.repeat_rows(2)
+    expanded, _ = _moe_row_validities(
+        v, x, None, 2, second_layer=True, need_input=True, need_output=False
+    )
     expanded.validate(x)
+    original, unused = _moe_row_validities(
+        v, x[:, 0], None, 2, second_layer=False, need_input=True, need_output=False
+    )
+    assert original is v and unused is None
+    _, output_only = _moe_row_validities(
+        v, None, x, 2, second_layer=False, need_input=False, need_output=True
+    )
+    torch.testing.assert_close(output_only.is_padding, expanded.is_padding)
     expected = x.clone()
     expected[1] = 0
     torch.testing.assert_close(x.masked_fill(expanded.is_padding.reshape(3, 2, 1), 0), expected)

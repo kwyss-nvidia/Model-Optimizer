@@ -22,7 +22,7 @@ import sys
 import warnings
 from collections.abc import Callable
 from contextlib import contextmanager
-from functools import cache, partial
+from functools import partial
 from itertools import chain
 from types import ModuleType
 
@@ -30,7 +30,6 @@ import torch
 import vllm.model_executor.layers.fused_moe.layer as vllm_fused_moe_layer
 import vllm.model_executor.layers.linear as vllm_linear
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_tp_group
-from vllm.forward_context import get_forward_context, is_forward_context_available
 
 from ...utils.distributed import ParallelState
 from ..conversion import set_quantizer_by_cfg
@@ -43,45 +42,7 @@ from ..nn import (
     quantize_with_validity,
 )
 from .custom import CUSTOM_MODEL_PLUGINS
-from .vllm_validity import validity_from_forward_context
-
-
-def _activation_validity():
-    if not is_forward_context_available():
-        return None
-    return validity_from_forward_context(get_forward_context())
-
-
-@cache
-def _kernel_signature(kernel):
-    return inspect.signature(kernel)
-
-
-def _moe_validity(a, b, c, args, kwargs, kernel, *, second_layer):
-    validity = _activation_validity()
-    if validity is None:
-        return None, None
-    # Only these launchers establish token-major inputs; packed expert layouts
-    # need their dispatch permutation applied to the validity mask first.
-    if kernel.__name__ not in _FUSED_MOE_KERNEL_CANDIDATES:
-        raise NotImplementedError("Unknown MoE activation layout for row validity.")
-    bound = _kernel_signature(kernel).bind(a, b, c, *args, **kwargs)
-    bound.apply_defaults()
-    if bound.arguments.get("A_is_sorted", False) or bound.arguments.get("C_is_sorted", False):
-        raise NotImplementedError("Sorted MoE buffers require a transformed validity mask.")
-    if get_ep_group().world_size > 1:
-        raise NotImplementedError("Expert dispatch requires locally mapped row validity.")
-    topk_weights = bound.arguments.get("topk_weights")
-    if topk_weights is None or topk_weights.ndim != 2:
-        raise NotImplementedError("MoE validity requires token-major top-k assignments.")
-    if topk_weights.shape[0] != validity.row_capacity:
-        raise ValueError("MoE assignments do not match the runner token layout.")
-    expanded = validity.repeat_rows(topk_weights.shape[1])
-    input_validity = expanded if second_layer else validity
-    input_validity.validate(a)
-    expanded.validate(c)
-    return input_validity, expanded
-
+from .vllm_validity import TOKEN_MAJOR_MOE_KERNELS, activation_validity, moe_validity
 
 _NVFP4_ATTENTION_QUANTIZER_CFG = {
     "num_bits": (2, 1),
@@ -254,11 +215,8 @@ _ATTENTION_TYPES = tuple(
 # vLLM may call one entry (e.g. ``dispatch_fused_moe_kernel``) which then calls another
 # (e.g. ``invoke_fused_moe_triton_kernel``). Patching every name would otherwise apply fakequant
 # twice; see ``_moe_fakequant_active`` in ``invoke_fused_moe_quantized``.
-_FUSED_MOE_KERNEL_CANDIDATES = (
-    "invoke_fused_moe_kernel",
-    "invoke_fused_moe_triton_kernel",
-    "dispatch_fused_moe_kernel",
-)
+_FUSED_MOE_KERNEL_CANDIDATES = TOKEN_MAJOR_MOE_KERNELS
+
 # The launchers bind the kernels by name at import time, so patching only the defining module
 # would miss the call sites that vLLM >= 0.24 moved into ``experts.triton_moe``.
 _FUSED_MOE_KERNEL_MODULE_PATHS = (
@@ -523,7 +481,7 @@ class FakeQuantMethod:
             torch.Tensor: The quantized output tensor.
         """
         if layer.input_quantizer.is_enabled:
-            x = quantize_with_validity(layer.input_quantizer, x, _activation_validity())
+            x = quantize_with_validity(layer.input_quantizer, x, activation_validity())
         if layer.weight_quantizer.is_enabled:
             original_weight = layer.weight
             quantized_tensor = layer.weight_quantizer(layer.weight)
@@ -541,7 +499,7 @@ class FakeQuantMethod:
                 layer.weight = original_weight
         else:
             output = self.quant_method.apply(layer, x, bias)
-        output = quantize_with_validity(layer.output_quantizer, output, _activation_validity())
+        output = quantize_with_validity(layer.output_quantizer, output, activation_validity())
         return output
 
 
@@ -817,9 +775,20 @@ class _QuantFusedMoEBase(QuantModule):
             if B is self.w13_weight
             else (self.w2_input_quantizer, self.w2_output_quantizer)
         )
-        if any(q.is_enabled and getattr(q, "supports_validity", False) for q in quantizers):
-            input_validity, output_validity = _moe_validity(
-                A, B, C, args, kwargs, original_kernel, second_layer=B is self.w2_weight
+        need_input, need_output = (
+            q.is_enabled and getattr(q, "supports_validity", False) for q in quantizers
+        )
+        if need_input or need_output:
+            input_validity, output_validity = moe_validity(
+                A,
+                B,
+                C,
+                args,
+                kwargs,
+                original_kernel,
+                second_layer=B is self.w2_weight,
+                need_input=need_input,
+                need_output=need_output,
             )
         if B is self.w13_weight:
             # First layer of expert

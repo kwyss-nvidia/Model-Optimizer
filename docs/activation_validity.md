@@ -14,7 +14,10 @@ maps to `valid_rows`; this adapter belongs in the separately registered backend,
 
 The vLLM plugin borrows ForwardContext tensors without creating a runtime or importing
 ModelOpt into vLLM. Ordinary linear calls preserve the token row axis. Known unsorted,
-local MoE kernel layouts map FC2 through token-major top-k repetition. Sorted buffers,
+local MoE kernel layouts map FC2 through token-major top-k repetition. Context lookup,
+translation and row expansion live in `plugins/vllm_validity.py`; `TensorValidity` itself
+contains only metadata and validation. Expansion is performed only for a supporting FC2
+input or MoE output quantizer; FC1 input-only quantization reuses the original metadata. Sorted buffers,
 expert-parallel dispatch, and mismatched capacities fail rather than guessing a mapping.
 Other transformed layouts need explicit adapters before they can use this contract.
 
