@@ -241,15 +241,20 @@ def _suspend_weight_cache(model: nn.Module):
         _ACTIVE.update(sessions)
 
 
-def cached_fake_quantize(quantizer, inputs: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+def cached_fake_quantize(
+    quantizer, inputs: torch.Tensor, source: torch.Tensor, *, validity=None
+) -> torch.Tensor:
     """``quantizer._fake_quantize(inputs)``, reused while ``quantizer`` is in an open scope.
 
     ``source`` is the tensor the quantizer received, from which ``inputs`` was derived (e.g. by
     padding). It keys the entry, so that a derived tensor made afresh on each call still hits.
+    As with weights, callers must keep validity constant for the lifetime of a cache scope.
+    Validity is forwarded on misses, not used to disable caching or synchronize device state.
     """
+    kwargs = {} if validity is None else {"validity": validity}
     session = _ACTIVE.get(quantizer) if _num_open_scopes else None
     if session is None:
-        return quantizer._fake_quantize(inputs)
+        return quantizer._fake_quantize(inputs, **kwargs)
 
     key = _input_key(source)
     entry = session.entries.get(quantizer)
@@ -258,7 +263,7 @@ def cached_fake_quantize(quantizer, inputs: torch.Tensor, source: torch.Tensor) 
         entry = None
     if entry is None:
         with torch.no_grad():
-            value = quantizer._fake_quantize(inputs)
+            value = quantizer._fake_quantize(inputs, **kwargs)
         if (value.shape, value.dtype, value.device) != (inputs.shape, inputs.dtype, inputs.device):
             raise ValueError("A cached fake quant must keep the weight's shape, dtype and device.")
         if value.untyped_storage().data_ptr() == inputs.untyped_storage().data_ptr():

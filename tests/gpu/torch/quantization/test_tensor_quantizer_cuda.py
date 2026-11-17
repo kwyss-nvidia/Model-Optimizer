@@ -29,6 +29,7 @@ from modelopt.torch.quantization import tensor_quant
 from modelopt.torch.quantization.config import QuantizerAttributeConfig
 from modelopt.torch.quantization.extensions import get_cuda_ext_mx
 from modelopt.torch.quantization.model_calib import enable_stats_collection, finish_stats_collection
+from modelopt.torch.quantization.nn import TensorValidity
 from modelopt.torch.quantization.nn.modules import tensor_quantizer
 
 
@@ -166,3 +167,45 @@ def test_use_constant_amax_captures_in_cuda_graph():
     static_in.copy_(new_in)
     graph.replay()
     assert torch.equal(static_out, quantizer(new_in))
+
+
+@pytest.mark.parametrize("prefix", [True, False])
+def test_row_validity_cuda_graph_replay(prefix):
+    """An opted-in backend must observe changed counts/masks during replay."""
+
+    def backend(inputs, quantizer, *, validity=None):
+        if validity is not None:
+            padding = (
+                torch.arange(validity.row_capacity, device=inputs.device) >= validity.num_valid_rows
+                if validity.valid_rows_are_prefix
+                else validity.is_padding
+            )
+            inputs = inputs.masked_fill(padding[:, None], 0)
+        return inputs / inputs.abs().amax().clamp_min(1e-12)
+
+    tensor_quantizer.register_quant_backend("graph_validity", backend, supports_validity=True)
+    try:
+        quantizer = tensor_quantizer.TensorQuantizer(
+            QuantizerAttributeConfig(axis=None, backend="graph_validity")
+        ).cuda()
+        x = torch.tensor([[0.3, 1.0], [10000.0, -10000.0], [0.7, 2.0]], device="cuda")
+        count = torch.tensor(1, device="cuda", dtype=torch.int64)
+        mask = torch.tensor([False, True, True], device="cuda")
+        validity = TensorValidity(count, mask, prefix, 3)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            quantizer(x, validity=validity)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = quantizer(x, validity=validity)
+        for n in (1, 3, 0, 2):
+            count.fill_(n)
+            mask.copy_(torch.arange(3, device="cuda") >= count)
+            graph.replay()
+            torch.testing.assert_close(output, quantizer(x, validity=validity))
+            if n:
+                torch.testing.assert_close(output[:n], quantizer(x[:n]))
+    finally:
+        tensor_quantizer.unregister_quant_backend("graph_validity")

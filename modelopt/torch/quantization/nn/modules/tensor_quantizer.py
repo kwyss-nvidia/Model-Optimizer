@@ -18,8 +18,7 @@
 import contextlib
 import math
 import warnings
-from collections.abc import Callable
-from typing import Any, Protocol, TypeGuard
+from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, cast
 
 import torch
 import torch.distributed as dist
@@ -56,6 +55,10 @@ from ...utils import is_torch_export_mode
 from ...utils.numeric_utils import E4M3_MAX, fp8_max_for_normalization
 from ...utils.weight_cache import cached_fake_quantize
 from ..functional import normalized_hadamard_transform
+from .tensor_validity import TensorValidity, quantize_with_validity
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # torch.finfo(...).tiny gives the smallest normal E4M3 value; scale clamping needs
 # the smallest positive subnormal value representable by the 3-bit mantissa.
@@ -75,15 +78,40 @@ __all__ = [
 ]
 
 
-QuantBackendEntrypoint = Callable[[torch.Tensor, "TensorQuantizer"], torch.Tensor]
+class LegacyQuantBackend(Protocol):
+    """Backend accepting the original positional quantization arguments."""
+
+    def __call__(self, inputs: torch.Tensor, quantizer: "TensorQuantizer", /) -> torch.Tensor: ...
+
+
+class ValidityQuantBackend(Protocol):
+    """Backend also accepting optional execution-time row validity."""
+
+    def __call__(
+        self,
+        inputs: torch.Tensor,
+        quantizer: "TensorQuantizer",
+        /,
+        *,
+        validity: TensorValidity | None = None,
+    ) -> torch.Tensor: ...
+
+
+# supports_validity=True requires the ValidityQuantBackend signature; the union
+# accepts both interfaces but does not enforce that relationship to the flag.
+QuantBackendEntrypoint = LegacyQuantBackend | ValidityQuantBackend
 
 _QUANT_FUNCTIONAL_BACKENDS: dict[str, QuantBackendEntrypoint] = {}
+_VALIDITY_BACKENDS: set[str] = set()
 
 
-def register_quant_backend(name: str, entrypoint: QuantBackendEntrypoint) -> None:
+def register_quant_backend(
+    name: str, entrypoint: QuantBackendEntrypoint, *, supports_validity: bool = False
+) -> None:
     """Register a custom quantization backend.
 
     Args:
+        supports_validity: Opt into the optional ``validity`` keyword at execution time.
         name: The name of the backend.
         entrypoint: The entrypoint of the backend. The entrypoint should be a callable that takes in
             the inputs and the tensor quantizer as arguments and returns the quantized tensor.
@@ -98,6 +126,9 @@ def register_quant_backend(name: str, entrypoint: QuantBackendEntrypoint) -> Non
     if name in _QUANT_FUNCTIONAL_BACKENDS:
         warnings.warn(f"Overwriting existing backend: {name}")
     _QUANT_FUNCTIONAL_BACKENDS[name] = entrypoint
+    _VALIDITY_BACKENDS.discard(name)
+    if supports_validity:
+        _VALIDITY_BACKENDS.add(name)
 
 
 def unregister_quant_backend(name: str) -> None:
@@ -109,6 +140,7 @@ def unregister_quant_backend(name: str) -> None:
     if not isinstance(name, str) or not name:
         raise ValueError("Backend name must be a non-empty string.")
     _QUANT_FUNCTIONAL_BACKENDS.pop(name, None)
+    _VALIDITY_BACKENDS.discard(name)
 
 
 def is_registered_quant_backend(name: str) -> bool:
@@ -917,12 +949,15 @@ class TensorQuantizer(nn.Module):
         self._dequantize = True
         return outputs
 
-    def _fake_quantize(self, inputs):
+    def _fake_quantize(self, inputs, *, validity: TensorValidity | None = None):
         """Fake quantization."""
         if self.backend is not None:
             if self.backend not in _QUANT_FUNCTIONAL_BACKENDS:
                 raise KeyError(f"Quant backend '{self.backend}' is not registered.")
             entrypoint = _QUANT_FUNCTIONAL_BACKENDS[self.backend]
+            # forward() checks support and coerces validity to None when unsupported.
+            if validity is not None:
+                return cast("ValidityQuantBackend", entrypoint)(inputs, self, validity=validity)
             return entrypoint(inputs, self)
 
         amax = None
@@ -1177,15 +1212,38 @@ class TensorQuantizer(nn.Module):
 
         return amax
 
-    def forward(self, inputs):
+    @property
+    def supports_validity(self) -> bool:
+        """Whether this quantizer can consume execution-time row validity."""
+        return (
+            type(self).forward is TensorQuantizer.forward
+            and type(self)._fake_quantize is TensorQuantizer._fake_quantize
+            and self.backend in _VALIDITY_BACKENDS
+            and not self._if_calib
+            and self.fake_quant
+            and not self.is_static_block_quant
+            and self.bias_calibrator is None
+        )
+
+    def forward(self, inputs, *, validity: TensorValidity | None = None):
         """Apply tensor_quant function to inputs.
 
         Args:
             inputs: A Tensor of type float32/float16/bfloat16.
+            validity: Optional row validity; never saved as quantizer state.
 
         Returns:
             outputs: A Tensor of type output_dtype
         """
+        # Cache enrollment promises both weights and validity stay constant within a scope.
+        cache_source = inputs
+        # TODO: Map validity through DTensor placements to local rows before forwarding it.
+        # Until then, use the existing DTensor path without validity.
+        if validity is not None and (not self.supports_validity or isinstance(inputs, DTensor)):
+            validity = None
+        if validity is not None and not self._disabled:
+            validity.validate(inputs)
+
         if isinstance(inputs, DTensor):
             # TensorQuantizer only handles regular non-DTensor inputs
             device_mesh, placements = inputs.device_mesh, inputs.placements
@@ -1199,8 +1257,6 @@ class TensorQuantizer(nn.Module):
         # Early return if nothing is collected during the forward (e.g. MoE)
         if inputs.numel() == 0:
             return inputs
-        # The weight cache keys on this tensor, not on the fresh ones (scaled, padded) made from it below.
-        cache_source = inputs
 
         # Activation scaling for smoothquant
         if self.pre_quant_scale is not None:
@@ -1265,7 +1321,7 @@ class TensorQuantizer(nn.Module):
                 inputs = inputs.contiguous()
             if self.fake_quant:
                 with same_device_as(inputs):
-                    outputs = cached_fake_quantize(self, inputs, cache_source)
+                    outputs = cached_fake_quantize(self, inputs, cache_source, validity=validity)
             elif not self._dequantize:
                 outputs = self._real_quantize(inputs)
             else:
@@ -2013,6 +2069,17 @@ class SequentialQuantizer(_QuantizerContainerBase, nn.Sequential):
         assert all(isinstance(q, TensorQuantizer) for q in self), (
             "All quantizers must be a TensorQuantizer."
         )
+
+    @property
+    def supports_validity(self) -> bool:
+        """Whether any active stage can consume row validity."""
+        return any(q.is_enabled and getattr(q, "supports_validity", False) for q in self)
+
+    def forward(self, inputs, *, validity: TensorValidity | None = None):
+        """Apply each stage with the same row layout."""
+        for quantizer in self:
+            inputs = quantize_with_validity(quantizer, inputs, validity)
+        return inputs
 
     def _format_delegated_method_outputs(self, outputs: list[Any]) -> Any:
         return outputs[-1]

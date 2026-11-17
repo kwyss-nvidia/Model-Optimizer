@@ -26,6 +26,7 @@ from modelopt.torch.quantization.nn import (
     SequentialQuantizer,
     StaticBlockScaleQuantizer,
     TensorQuantizer,
+    TensorValidity,
     register_quant_backend,
     unregister_quant_backend,
 )
@@ -174,3 +175,37 @@ def test_enrollment_by_chunk():
     with weight_cache_scope(chunks[0]) as stats:
         chunks[0](torch.randn(4, 16))
     assert stats.misses == 1
+
+
+@pytest.mark.parametrize("custom_backend", [False, True])
+def test_weight_cache_with_validity(custom_backend):
+    """Stable validity preserves cache hits for opted-in backends and native fallback."""
+
+    def backend(inputs, quantizer, *, validity=None):
+        if validity is not None:
+            padding = (
+                torch.arange(validity.row_capacity, device=inputs.device) >= validity.num_valid_rows
+            )
+            inputs = inputs.masked_fill(padding[:, None], 0)
+        return inputs * 2
+
+    register_quant_backend("cached_validity", backend, supports_validity=True)
+    try:
+        model = _quantized_mlp(**({"backend": "cached_validity"} if custom_backend else {}))
+        q, weight = model[0].weight_quantizer, model[0].weight
+        validity = TensorValidity(torch.tensor(16), None, True, weight.shape[0])
+        expected = q(weight, validity=validity)
+        enable_weight_cache(model)
+        with weight_cache_scope(model) as stats:
+            for _ in range(3):
+                torch.testing.assert_close(q(weight, validity=validity), expected)
+            assert (stats.misses, stats.hits) == (1, 2)
+        # A new scope recomputes when the caller changes validity between steps.
+        validity.num_valid_rows.fill_(4)
+        with weight_cache_scope(model) as stats:
+            result = q(weight, validity=validity)
+            assert (stats.misses, stats.hits) == (1, 0)
+        torch.testing.assert_close(result, q(weight, validity=validity))
+        assert torch.equal(result, expected) != custom_backend
+    finally:
+        unregister_quant_backend("cached_validity")
