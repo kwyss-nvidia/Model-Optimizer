@@ -64,6 +64,21 @@ class TensorValidity:
         ):
             raise ValueError("Padding mask must be a boolean vector over input rows on its device.")
 
+    def amax_inputs(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Exclude padding from absolute-max statistics without changing quantizer inputs.
+
+        Zero is neutral for absolute maximum, including an all-padding batch.
+        This fixed-shape operation also masks NaN/Inf padding and avoids host sync.
+
+        FIXME(kwyss): Replace with calls to the is_padding or valid_tokens aware amax calls.
+        """
+        self.validate(inputs)
+        if self.valid_rows_are_prefix:
+            valid = torch.arange(self.row_capacity, device=inputs.device) < self.num_valid_rows
+        else:
+            valid = ~self.is_padding
+        return torch.where(valid.reshape(*inputs.shape[:-1], 1), inputs, 0)
+
 
 def quantize_with_validity(quantizer, inputs, validity: TensorValidity | None = None):
     """Pass validity to supporting quantizers, otherwise preserve the legacy call."""

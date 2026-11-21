@@ -9,22 +9,28 @@ Their entrypoint accepts `(inputs, quantizer, *, validity=None)`. A backend must
 invalid rows from statistics, preserve the input shape, and read device count/mask contents
 at execution time. It may use `validity.num_valid_rows` as a prefix only when
 `validity.valid_rows_are_prefix` is true; otherwise it needs `validity.is_padding`.
-A prefix-only backend must reject masks it cannot support. For psx-luts, a guaranteed prefix
-maps to `valid_rows`; this adapter belongs in the separately registered backend, not vLLM.
+A prefix-only provider must not interpret a non-prefix count as a prefix. Adapters may
+fall back to its legacy call when unsupported. For psx-luts, a guaranteed prefix maps to
+`valid_rows`; this adapter belongs in the separately registered backend, not vLLM.
 
 The vLLM plugin borrows ForwardContext tensors without creating a runtime or importing
 ModelOpt into vLLM. Ordinary linear calls preserve the token row axis. Known unsorted,
 local MoE kernel layouts map FC2 through token-major top-k repetition. Context lookup,
 translation and row expansion live in `plugins/vllm_validity.py`; `TensorValidity` itself
-contains only metadata and validation. Expansion is performed only for a supporting FC2
+contains metadata, validation, and a helper for padding-free amax statistics. Expansion is performed only for a supporting FC2
 input or MoE output quantizer; FC1 input-only quantization reuses the original metadata. Sorted buffers,
 expert-parallel dispatch, and mismatched capacities fail rather than guessing a mapping.
 Other transformed layouts need explicit adapters before they can use this contract.
 
-The generic path never masks, crops, or zeros activation values. Native quantizers currently
+The generic path does not mask or crop the values sent to quantization. Native quantizers currently
 use their existing behavior without validity. Only explicitly opted-in backends receive the
-metadata and decide how their kernels consume it. Calibration, static block reshaping, bias
-statistics, real quantization and DTensor inputs also use the existing path without validity.
+metadata and decide how their kernels consume it. For these backends, max calibration
+excludes padding, and `_get_amax(inputs, validity=validity)` computes a padding-free dynamic
+statistic when no stored amax exists. Stored and constant amax remain unchanged. The statistic
+helper uses a fixed-shape masked temporary; it does not modify quantizer inputs or read a
+count on the host. Zero is neutral for absolute maximum, including all-padding inputs.
+Other calibration algorithms, static block reshaping, bias statistics, real quantization
+and DTensor inputs use the existing path without validity.
 A TODO in `TensorQuantizer.forward` tracks mapping validity through DTensor placements to
 local shards before enabling support.
 Unsupported backends, subclasses and modes fall back to their existing call path without

@@ -792,7 +792,7 @@ class TensorQuantizer(nn.Module):
         else:
             self._bias_value.data.copy_(calib_bias.clone().detach())
 
-    def _get_amax(self, inputs):
+    def _get_amax(self, inputs, *, validity: TensorValidity | None = None):
         """Get amax from buffer or compute it dynamically."""
         if self._use_constant_amax:
             # torch.full fills on the device; torch.tensor would copy from the host on every call,
@@ -805,6 +805,8 @@ class TensorQuantizer(nn.Module):
             if amax.device != inputs.device:
                 amax = amax.to(inputs.device)
         else:
+            if validity is not None:
+                inputs = validity.amax_inputs(inputs)
             reduce_axis = quant_utils.convert_quantization_axis_to_reduce_axis(inputs, self._axis)
             amax = quant_utils.reduce_amax(inputs, axis=reduce_axis, keepdims=True).detach()
 
@@ -1219,7 +1221,7 @@ class TensorQuantizer(nn.Module):
             type(self).forward is TensorQuantizer.forward
             and type(self)._fake_quantize is TensorQuantizer._fake_quantize
             and self.backend in _VALIDITY_BACKENDS
-            and not self._if_calib
+            and (not self._if_calib or type(self._calibrator) is calib.MaxCalibrator)
             and self.fake_quant
             and not self.is_static_block_quant
             and self.bias_calibrator is None
@@ -1312,7 +1314,10 @@ class TensorQuantizer(nn.Module):
                 )
                 assert block_size is not None, "block size for dynamic quantization not found."
 
-            self.collect(inputs)
+            if validity is not None:
+                self.collect(validity.amax_inputs(inputs))
+            else:
+                self.collect(inputs)
 
         if self._if_quant:
             # Check if the input tensor is contiguous
